@@ -36,6 +36,9 @@ bitflags! {
         const ARRAY = 0x1 << 0;
         const ENTRY = 0x1 << 1;
         const LIST_NODE = 0x1 << 2;
+
+        const ART_NODE = 0x1 << 3;
+        const ART_LEAF = 0x1 << 4;
     }
 }
 
@@ -52,7 +55,7 @@ pub struct Element<T: ElementLayout> {
 }
 
 impl<T: ElementLayout> Element<T> {
-    pub(self) fn new(data: T) -> Self {
+    pub(super) fn new(data: T) -> Self {
         Element {
             meta: RecordMeta::element(T::element_type()),
             data,
