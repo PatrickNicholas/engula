@@ -75,8 +75,15 @@ impl<L: ArtLeaf> Art<L> {
         key: &[u8],
         value: BoxElement<L>,
     ) -> RawNode<L> {
+        println!(
+            "insert record: raw_node {:X} depth {}, key {:?}",
+            unsafe { raw_node.address() },
+            depth,
+            key
+        );
         match raw_node.as_mut() {
             NodeTypeMut::Empty => {
+                println!("insert into empty node");
                 self.size += 1;
                 RawNode::from_leaf(value)
             }
@@ -98,6 +105,7 @@ impl<L: ArtLeaf> Art<L> {
         let num_compressed = node.compressed_prefix_len();
         let num_cached = std::cmp::min(MAX_CACHED_PREFIX, num_compressed);
         let num_matched = match_keys(&node.cached_prefix[..num_cached], &key[depth..]);
+        println!("node_insert: depth {}, key {:?}, N {}, NN {}, num_compressed {}, num_cached {}, num_matched {}", depth, key, N, NN, num_compressed, num_cached, num_matched);
         if num_matched == MAX_CACHED_PREFIX {
             // All cached prefix are matched, load entire key and retry.
             let compressed_prefix = self.load_compressed_prefix(node, depth);
@@ -119,31 +127,19 @@ impl<L: ArtLeaf> Art<L> {
         }
 
         let depth = depth + num_compressed;
-        if depth == key.len() {
-            node.leaf = RawNode::from_leaf(value);
-            return RawNode::from_node_ref(node);
-        }
-
-        let next_byte = key[depth];
-        match node.find_child_mut(next_byte) {
+        match node.find_child_mut(depth, key) {
             Some(child) => {
                 *child = self.insert_record(*child, depth + 1, key, value);
                 RawNode::from_node_ref(node)
             }
-            None => node.add_record::<NN>(next_byte, value),
-        }
-    }
-
-    fn node_add_child<const N: usize>(
-        new_node: &mut Node<N, L>,
-        depth: usize,
-        key: &[u8],
-        raw_node: RawNode<L>,
-    ) {
-        if key.len() == depth {
-            new_node.leaf = raw_node;
-        } else {
-            new_node.add_child_node(key[depth], raw_node);
+            None => {
+                self.size += 1;
+                let raw_node = node.add_record::<NN>(depth, key, value);
+                println!("node.add_record, raw_node is {:X}", unsafe {
+                    raw_node.address()
+                });
+                raw_node
+            }
         }
     }
 
@@ -155,38 +151,24 @@ impl<L: ArtLeaf> Art<L> {
         value: BoxElement<L>,
     ) -> RawNode<L> {
         let leaf_key = leaf.art_key();
-        debug_assert!(depth <= key.len());
-        debug_assert!(
-            depth <= leaf_key.len(),
-            "key {:?}, leaf key {:?} depth {}",
-            key,
-            leaf_key,
-            depth
+        println!(
+            "leaf key {:?}, new key {:?}, depth: {}",
+            leaf_key, key, depth
         );
-
         let num_matched = match_keys(&leaf_key[depth..], &key[depth..]);
         if num_matched == leaf_key.len() && num_matched == key.len() {
+            // replace old leaf.
+            unsafe { BoxElement::from_raw(NonNull::from(leaf)) };
             return RawNode::from_leaf(value);
         }
-
-        // Avoid situations where one key is a prefix of another.
-        // let mut limit = depth + num_matched;
-        // if num_matched > 0 && (limit == leaf_key.len() || limit == key.len()) {
-        //     assert!(limit > 0);
-        //     limit -= 1;
-        // }
 
         let limit = depth + num_matched;
         let mut new_node = BoxNode::<4, L>::new();
         new_node.install_prefix(&key[depth..limit]);
-        Self::node_add_child(&mut new_node, limit, key, RawNode::from_leaf(value));
-        Self::node_add_child(&mut new_node, limit, leaf_key, RawNode::from_leaf_ref(leaf));
-
-        // println!(
-        //     "leaf node insert, num matched {}, leaf key byte {}, key byte {}",
-        //     num_matched, leaf_key[limit], key[limit]
-        // );
+        new_node.add_child(limit, key, value);
+        new_node.add_child_node(limit, leaf_key, RawNode::from_leaf_ref(leaf));
         self.size += 1;
+        println!("insert into leaf node");
 
         RawNode::from_node(new_node)
     }
@@ -204,18 +186,13 @@ impl<L: ArtLeaf> Art<L> {
 
         let mut new_node = BoxNode::<4, L>::new();
         new_node.install_prefix(&compressed_prefix[..num_matched]);
-        Self::node_add_child(
-            &mut new_node,
-            depth + num_matched,
-            key,
-            RawNode::from_leaf(value),
-        );
-        // new_node.add_child(key[depth + num_matched], value);
+        new_node.add_child(depth + num_matched, key, value);
 
         // shrink the original node's compressed path.
-        let compressed_next_byte = compressed_prefix[num_matched];
         node.install_prefix(&compressed_prefix[num_matched + 1..]);
-        new_node.add_child_node(compressed_next_byte, RawNode::from_node_ref(node));
+        new_node.add_child_node(num_matched, compressed_prefix, RawNode::from_node_ref(node));
+        self.size += 1;
+        println!("insert into expand node");
 
         RawNode::from_node(new_node)
     }
@@ -256,9 +233,7 @@ impl<L: ArtLeaf> Art<L> {
         key: &[u8],
     ) -> (RawNode<L>, Option<BoxElement<L>>) {
         match raw_node.as_mut() {
-            NodeTypeMut::Empty => {
-                panic!("remove_record reach empty node");
-            }
+            NodeTypeMut::Empty => (raw_node, None),
             NodeTypeMut::Node4(node) => self.node_remove::<4>(node, depth, key),
             NodeTypeMut::Node16(node) => self.node_remove::<16>(node, depth, key),
             NodeTypeMut::Node48(node) => self.node_remove::<48>(node, depth, key),
@@ -285,28 +260,25 @@ impl<L: ArtLeaf> Art<L> {
             return (RawNode::from_node_ref(node), None);
         }
 
-        if depth == key.len() {
-            let (_, retval) = match std::mem::take(&mut node.leaf).as_mut() {
-                NodeTypeMut::Leaf(leaf) => self.leaf_remove(leaf, key),
-                NodeTypeMut::Empty => (RawNode::default(), None),
-                _ => panic!("node leaf isn't leaf type"),
-            };
-            return (RawNode::from_node_ref(node), retval);
-        }
-
-        let next_byte = key[depth];
-        let child = match node.find_child_mut(next_byte) {
+        let child = match node.find_child_mut(depth, key) {
             Some(child) => child,
             None => {
-                println!("node_remove: no such child exists {}", next_byte);
+                println!(
+                    "node_remove: key {:?} depth {} no such child exists",
+                    key, depth
+                );
                 return (RawNode::from_node_ref(node), None);
             }
         };
 
         let (raw_node, retval) = self.remove_record(*child, depth + 1, key);
         *child = raw_node;
-        if retval.is_some() {
-            node.remove_child(next_byte);
+        if retval.is_some() && raw_node.is_empty_node() {
+            node.remove_child(depth, key);
+            if node.num_children() == 0 {
+                unsafe { BoxElement::from_raw(NonNull::from(node)) };
+                return (RawNode::default(), retval);
+            }
         }
         (RawNode::from_node_ref(node), retval)
     }
@@ -316,12 +288,12 @@ impl<L: ArtLeaf> Art<L> {
         leaf: &mut Element<L>,
         key: &[u8],
     ) -> (RawNode<L>, Option<BoxElement<L>>) {
-        println!("leaf_remove: leaf key {:?}, arg {:?}", leaf.art_key(), key);
         if leaf.art_key() != key {
             (RawNode::from_leaf_ref(leaf), None)
         } else {
             self.size -= 1;
 
+            println!("leaf_remove: leaf key {:?}, arg {:?}", leaf.art_key(), key);
             unsafe {
                 // Safety: Once leaf is hosted on box, the reference to it will be set to
                 // `RawNode::default`.
@@ -370,8 +342,7 @@ impl<L: ArtLeaf> Art<L> {
             };
         }
 
-        let next_byte = key[depth];
-        match node.find_child(next_byte) {
+        match node.find_child(depth, key) {
             Some(child) => self.search_record(child, depth + 1, key),
             None => None,
         }
@@ -435,7 +406,7 @@ mod tests {
         let mut art = Art::<Array>::new();
 
         let mut array = BoxElement::<Array>::with_capacity(expect_key.len());
-        array.data_slice_mut().copy_from_slice(&expect_key);
+        array.data_slice_mut().copy_from_slice(expect_key);
         unsafe {
             let raw_node = art.insert_record(RawNode::default(), 0, expect_key, array);
             let leaf = match raw_node.as_ref() {
@@ -489,27 +460,18 @@ mod tests {
             assert!(matches!(value_1_node.as_ref(), NodeType::Leaf(_)));
             let value_2_node = art.insert_record(value_1_node, 0, &expect_key_2, value_2);
             assert!(matches!(value_2_node.as_ref(), NodeType::Node4(_)));
-            unsafe {
-                let node = match value_2_node.as_mut() {
-                    NodeTypeMut::Node4(node) => node,
-                    _ => panic!("wrong node type"),
-                };
-                assert_eq!(node.compressed_prefix_len(), expect_prefix_len);
-                assert_eq!(
-                    &node.cached_prefix
-                        [..std::cmp::min(node.compressed_prefix_len(), MAX_CACHED_PREFIX)],
-                    &cached_prefix
-                );
-                drop(node);
-                art.remove_record(value_2_node, 0, &expect_key_1);
-                art.remove_record(value_2_node, 0, &expect_key_2);
-
-                let node = match value_2_node.as_mut() {
-                    NodeTypeMut::Node4(node) => node,
-                    _ => panic!("wrong node type"),
-                };
-                BoxElement::from_raw(NonNull::from(node));
-            }
+            let node = match value_2_node.as_mut() {
+                NodeTypeMut::Node4(node) => node,
+                _ => panic!("wrong node type"),
+            };
+            assert_eq!(node.compressed_prefix_len(), expect_prefix_len);
+            assert_eq!(
+                &node.cached_prefix
+                    [..std::cmp::min(node.compressed_prefix_len(), MAX_CACHED_PREFIX)],
+                &cached_prefix
+            );
+            art.remove_record(value_2_node, 0, &expect_key_1);
+            art.remove_record(value_2_node, 0, &expect_key_2);
         }
     }
 
@@ -521,6 +483,8 @@ mod tests {
             "foo1".as_bytes().into(),
             "foo12".as_bytes().into(),
             "foo123".as_bytes().into(),
+            "foo1234".as_bytes().into(),
+            "foo12345".as_bytes().into(),
         ];
 
         let mut root = RawNode::default();
@@ -529,41 +493,63 @@ mod tests {
             value.data_slice_mut().copy_from_slice(key);
             root = art.insert_record(root, 0, key, value);
         }
+
+        for key in &keys {
+            let (raw_node, _) = art.remove_record(root, 0, key);
+            root = raw_node;
+        }
     }
 
-    // #[test]
+    #[test]
     fn node_grow() {
         use std::ops::Range;
 
         fn make_keys(prefix: &str, range: Range<u8>) -> Vec<Vec<u8>> {
             range
                 .into_iter()
-                .map(|idx| format!("{}{}", prefix, idx).as_bytes().into())
+                .map(|idx| {
+                    let mut v: Vec<u8> = prefix.as_bytes().into();
+                    v.push(idx);
+                    v
+                })
                 .collect::<Vec<_>>()
         }
 
-        let mut art = Art::<Array>::new();
-        let keys = make_keys("fo", 1..4);
-
-        let mut root = RawNode::default();
-        for key in &keys {
-            let mut value = BoxElement::<Array>::with_capacity(key.len());
-            value.data_slice_mut().copy_from_slice(key);
-            root = art.insert_record(root, 0, key, value);
+        struct TestCase {
+            keys: Vec<Vec<u8>>,
         }
 
-        unsafe {
+        let cases = vec![
+            TestCase {
+                keys: make_keys("fo", 0..5),
+            },
+            TestCase {
+                keys: make_keys("fo", 0..17),
+            },
+            TestCase {
+                keys: make_keys("fo", 0..49),
+            },
+            TestCase {
+                keys: make_keys("fo", 0..255),
+            },
+        ];
+
+        for case in cases {
+            let mut art = Art::<Array>::new();
+            let keys = case.keys;
+
+            let mut root = RawNode::default();
+            for key in &keys {
+                let mut value = BoxElement::<Array>::with_capacity(key.len());
+                value.data_slice_mut().copy_from_slice(key);
+                root = art.insert_record(root, 0, key, value);
+            }
+
             for key in &keys {
                 let (new_node, record) = art.remove_record(root, 0, key);
                 assert!(record.is_some());
                 root = new_node;
             }
-
-            let node = match root.as_mut() {
-                NodeTypeMut::Node4(node) => node,
-                _ => panic!("wrong node type"),
-            };
-            BoxElement::from_raw(NonNull::from(node));
         }
     }
 }

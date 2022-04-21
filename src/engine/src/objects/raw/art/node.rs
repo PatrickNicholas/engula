@@ -55,13 +55,21 @@ impl<const N: usize, L: ArtLeaf> Node<N, L> {
         self.compressed_prefix_len = prefix.len() as u32;
     }
 
-    pub fn add_child(&mut self, byte: u8, value: BoxElement<L>) {
-        self.add_child_node(byte, RawNode::from_leaf(value));
+    pub fn add_child(&mut self, depth: usize, key: &[u8], value: BoxElement<L>) {
+        self.add_child_node(depth, key, RawNode::from_leaf(value));
     }
 
-    pub fn add_child_node(&mut self, byte: u8, node: RawNode<L>) {
+    pub fn add_child_node(&mut self, depth: usize, key: &[u8], node: RawNode<L>) {
+        println!("add_child_node: N {} key {:?} with depth {}", N, key, depth);
+        if key.len() <= depth {
+            println!("add_child_node: key {:?} with depth {}", key, depth);
+            self.leaf = node;
+            return;
+        }
+
+        let byte = key[depth];
         let num_children = self.num_children as usize;
-        debug_assert!(num_children < MAX_CACHED_PREFIX);
+        debug_assert!(num_children < N);
 
         let idx = self.get_sorted_index(byte);
         if idx < num_children {
@@ -73,14 +81,23 @@ impl<const N: usize, L: ArtLeaf> Node<N, L> {
         self.children[idx] = node;
         self.num_children += 1;
         println!(
-            "add_child_node: idx {} byte {}, num_children {}, keys {:?}",
-            idx, byte, self.num_children, self.keys
+            "add_child_node: N {}, idx {} byte {}, num_children {}, keys {:?}",
+            N, idx, byte, self.num_children, self.keys
         );
     }
 
-    pub fn find_child_mut(&mut self, byte: u8) -> Option<&mut RawNode<L>> {
+    pub fn find_child_mut(&mut self, depth: usize, key: &[u8]) -> Option<&mut RawNode<L>> {
+        if key.len() <= depth {
+            return Some(&mut self.leaf);
+        }
+
+        let byte = key[depth];
         let num_children = self.num_children as usize;
-        assert!(num_children < self.keys.len());
+        assert!(
+            num_children <= self.keys.len(),
+            "num children {}",
+            num_children
+        );
 
         for i in 0..num_children {
             if self.keys[i] == byte {
@@ -94,7 +111,12 @@ impl<const N: usize, L: ArtLeaf> Node<N, L> {
         None
     }
 
-    pub fn find_child(&self, byte: u8) -> Option<RawNode<L>> {
+    pub fn find_child(&self, depth: usize, key: &[u8]) -> Option<RawNode<L>> {
+        if key.len() <= depth {
+            return Some(self.leaf);
+        }
+
+        let byte = key[depth];
         let num_children = self.num_children as usize;
         assert!(num_children < self.keys.len());
 
@@ -118,12 +140,18 @@ impl<const N: usize, L: ArtLeaf> Node<N, L> {
         self.num_children as usize == N
     }
 
-    pub fn remove_child(&mut self, byte: u8) {
+    pub fn remove_child(&mut self, depth: usize, key: &[u8]) {
+        if key.len() == depth {
+            self.leaf = RawNode::default();
+            return;
+        }
+
+        let byte = key[depth];
         let num_children = self.num_children as usize;
         let idx = self.get_sorted_index(byte);
         println!(
-            "remove_child, byte {}, idx {}, num_children {}",
-            byte, idx, num_children
+            "remove_child, byte {}, idx {}, num_children {}, keys {:?}",
+            byte, idx, num_children, self.keys
         );
         if idx < num_children {
             self.keys[..].copy_within(idx + 1..num_children, idx);
@@ -131,8 +159,17 @@ impl<const N: usize, L: ArtLeaf> Node<N, L> {
             self.num_children -= 1;
         }
     }
+
+    pub fn num_children(&self) -> usize {
+        let mut num_children = self.num_children as usize;
+        if !self.leaf.is_empty_node() {
+            num_children += 1;
+        }
+        num_children
+    }
 }
 
+#[allow(clippy::new_without_default)]
 impl<const N: usize, L: ArtLeaf> BoxElement<Node<N, L>> {
     pub fn new() -> Self {
         unsafe {
@@ -146,16 +183,26 @@ impl<const N: usize, L: ArtLeaf> BoxElement<Node<N, L>> {
 }
 
 impl<const N: usize, L: ArtLeaf> Element<Node<N, L>> {
-    pub fn add_record<const NN: usize>(&mut self, byte: u8, value: BoxElement<L>) -> RawNode<L> {
+    pub fn add_record<const NN: usize>(
+        &mut self,
+        depth: usize,
+        key: &[u8],
+        value: BoxElement<L>,
+    ) -> RawNode<L> {
         if self.is_full() {
-            self.grow_and_add::<NN>(byte, value)
+            self.grow_and_add::<NN>(depth, key, value)
         } else {
-            self.add_child(byte, value);
+            self.add_child(depth, key, value);
             RawNode::from_node_ref(self)
         }
     }
 
-    fn grow_and_add<const NN: usize>(&mut self, byte: u8, value: BoxElement<L>) -> RawNode<L> {
+    fn grow_and_add<const NN: usize>(
+        &mut self,
+        depth: usize,
+        key: &[u8],
+        value: BoxElement<L>,
+    ) -> RawNode<L> {
         let mut new_node = BoxNode::<NN, L>::new();
         new_node.num_children = self.num_children;
         new_node.compressed_prefix_len = self.compressed_prefix_len;
@@ -163,7 +210,9 @@ impl<const N: usize, L: ArtLeaf> Element<Node<N, L>> {
             new_node.keys[i] = self.keys[i];
             new_node.children[i] = std::mem::take(&mut self.children[i]);
         }
-        new_node.add_child(byte, value);
+        new_node.leaf = std::mem::take(&mut self.leaf);
+        new_node.cached_prefix = self.cached_prefix;
+        new_node.add_child(depth, key, value);
 
         self.num_children = 0;
         self.compressed_prefix_len = 0;
@@ -171,6 +220,11 @@ impl<const N: usize, L: ArtLeaf> Element<Node<N, L>> {
         unsafe {
             BoxElement::from_raw(NonNull::from(self));
         }
+        println!(
+            "grow_and_add: new_node {:X} NN is {}",
+            new_node.inner().as_ptr() as usize,
+            NN
+        );
 
         RawNode::from_node(new_node)
     }

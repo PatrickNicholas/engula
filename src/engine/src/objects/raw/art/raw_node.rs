@@ -24,8 +24,8 @@ const NODE_48: u8 = 3;
 const NODE_256: u8 = 4;
 const NODE_LEAF: u8 = 5;
 
-const fn node_tag(value: usize) -> u8 {
-    match value {
+const fn node_tag<const N: usize>() -> u8 {
+    match N {
         4 => NODE_4,
         16 => NODE_16,
         48 => NODE_48,
@@ -71,8 +71,9 @@ impl<L: ArtLeaf> RawNode<L> {
 
     pub fn from_node<const N: usize>(node: BoxNode<N, L>) -> Self {
         let address = BoxNode::leak(node).as_ptr() as *const _ as usize;
+        println!("RawNode::from_node address {:X}, N is {}", address, N);
         let mut values = address.to_le_bytes();
-        values[7] = node_tag(N);
+        values[7] = node_tag::<N>();
         RawNode {
             values,
             _mark: Default::default(),
@@ -82,7 +83,7 @@ impl<L: ArtLeaf> RawNode<L> {
     pub fn from_node_ref<const N: usize>(node: &Element<Node<N, L>>) -> Self {
         let address = node as *const _ as usize;
         let mut values = address.to_le_bytes();
-        values[7] = node_tag(N);
+        values[7] = node_tag::<N>();
         RawNode {
             values,
             _mark: Default::default(),
@@ -104,6 +105,11 @@ impl<L: ArtLeaf> RawNode<L> {
     #[inline(always)]
     pub fn as_mut<'a>(&self) -> NodeTypeMut<'a, L> {
         unsafe {
+            println!(
+                "RawNode::as_mut address {:X} tag {} ",
+                self.address(),
+                self.values[7]
+            );
             match self.values[7] {
                 NODE_EMPTY => NodeTypeMut::Empty,
                 NODE_4 => NodeTypeMut::Node4(self.cast_mut()),
@@ -135,7 +141,8 @@ impl<L: ArtLeaf> RawNode<L> {
         self.values[7] == NODE_EMPTY
     }
 
-    unsafe fn address(&self) -> usize {
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn address(&self) -> usize {
         let mut values = self.values;
         values[6] = 0;
         values[7] = 0;
